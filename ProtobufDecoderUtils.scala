@@ -1,19 +1,22 @@
 import java.io.*
 import java.nio.file.*
 
+import scala.annotation.tailrec
 import scala.jdk.CollectionConverters.*
 
+import com.google.protobuf.DescriptorProtos.FileDescriptorProto
 import com.google.protobuf.Descriptors.*
 import com.google.protobuf.*
 import com.google.protobuf.util.JsonFormat
 import zio.*
+import zio.prelude.*
 import zio.stream.*
 
 object ProtobufDecoderUtils:
 
   def dynamicMessages(
     pathToCompiledProto: String,
-    messageTypeName: String,
+    messageType: String,
     pathToPbData: String
   ): ZStream[Scope, Throwable, DynamicMessage] =
 
@@ -33,18 +36,48 @@ object ProtobufDecoderUtils:
       )
 
     ZStream.unwrap(
-      getDescriptor(pathToCompiledProto, messageTypeName)
+      getDescriptor(pathToCompiledProto, messageType)
         .map(d => singleMessage(d) orElse delimitedMessages(d))
     )
 
-  private def getDescriptor(pathToCompiledProto: String, messageTypeName: String): Task[Descriptors.Descriptor] =
+  private def getDescriptor(pathToCompiledProto: String, messageType: String): Task[Descriptors.Descriptor] =
+
+    def build(
+      fileProto: FileDescriptorProto,
+      fileDescriptorsByFileName: Map[String, Descriptors.FileDescriptor]
+    ): scala.Option[Descriptors.FileDescriptor] =
+      val deps = fileProto.getDependencyList().asScala.toList
+      deps
+        .forEach(fileDescriptorsByFileName.get)
+        .map(deps => Descriptors.FileDescriptor.buildFrom(fileProto, deps.toArray))
+
+    @tailrec
+    def buildAll(
+      protoFiles: List[FileDescriptorProto],
+      fileDescriptorsByFileName: Map[String, Descriptors.FileDescriptor]
+    ): Map[String, Descriptors.FileDescriptor] =
+      protoFiles match
+        case Nil => fileDescriptorsByFileName
+        case h :: t =>
+          build(h, fileDescriptorsByFileName) match
+            case None     => buildAll(t :+ h, fileDescriptorsByFileName)
+            case Some(fd) => buildAll(t, fileDescriptorsByFileName + (fd.getName() -> fd))
+
+    def findMessageTypeByName(fileDescriptorsByFileName: Map[String, Descriptors.FileDescriptor], messageType: String): scala.Option[Descriptors.Descriptor] =
+      (for
+        fd <- fileDescriptorsByFileName.values.toList
+        d  <- fd.getMessageTypes().asScala.toList
+        if d.getFullName() == messageType
+      yield d).headOption
+
     for
-      protoBytes <- ZIO.attempt(Files.readAllBytes(Paths.get(pathToCompiledProto)))
-      set        <- ZIO.attempt(DescriptorProtos.FileDescriptorSet.parseFrom(protoBytes))
-      fileProto  <- ZIO.attempt(set.getFile(0))
-      fileDesc   <- ZIO.attempt(Descriptors.FileDescriptor.buildFrom(fileProto, Array.empty))
-      descriptor <- ZIO.attempt(fileDesc.findMessageTypeByName(messageTypeName))
-    yield descriptor
+      protoBytes        <- ZIO.attempt(Files.readAllBytes(Paths.get(pathToCompiledProto)))
+      fileDescriptorSet <- ZIO.attempt(DescriptorProtos.FileDescriptorSet.parseFrom(protoBytes))
+      protoFiles        <- ZIO.attempt(fileDescriptorSet.getFileList().asScala.toList)
+      find <- ZIO
+        .attempt(findMessageTypeByName(buildAll(protoFiles, Map.empty), messageType))
+        .someOrFail(new RuntimeException(s"Could not find message type: $messageType"))
+    yield find
 
   private def createCodedInputStream(path: String): RIO[Scope, CodedInputStream] =
     for
