@@ -5,7 +5,7 @@ Note the program requires a
 
 ## Compile proto file into a descriptor set file
 
-`protoc --include_imports --descriptor_set_out somefilename.fds someprotofile.proto`
+`protoc -I=./path/to/protofile --include_imports --descriptor_set_out somefilename.fds someprotofile.proto`
 
 Compiles the given proto file to the output file descriptor file, including all imports.
 This file contains all the necessary schema info to decode the protobuf binary data.
