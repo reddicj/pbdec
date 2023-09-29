@@ -12,35 +12,41 @@ import zio.*
 import zio.prelude.*
 import zio.stream.*
 
-object ProtobufDecoderUtils:
+object DynamicMessages:
 
-  def dynamicMessages(
+  def withMessageType(
     pathToCompiledProto: String,
-    messageType: String,
-    pathToPbData: String
+    pathToData: String,
+    messageType: String
+  ): ZStream[Scope, Throwable, DynamicMessage] =
+    ZStream.unwrap(
+      getDescriptor(pathToCompiledProto, messageType)
+        .map(fromDescriptor(pathToData, _))
+    )
+
+  private def fromDescriptor(
+    pathToData: String,
+    descriptor: Descriptor
   ): ZStream[Scope, Throwable, DynamicMessage] =
 
     def singleMessage(descriptor: Descriptor): ZStream[Scope, Throwable, DynamicMessage] =
       ZStream.fromZIO(
         for
-          codedInputStream <- createCodedInputStream(pathToPbData)
+          codedInputStream <- createCodedInputStream(pathToData)
           message          <- ZIO.attempt(DynamicMessage.parseFrom(descriptor, codedInputStream))
         yield message
       )
 
     def delimitedMessages(descriptor: Descriptor): ZStream[Scope, Throwable, DynamicMessage] =
       ZStream.unwrap(
-        createCodedInputStream(pathToPbData).map(
+        createCodedInputStream(pathToData).map(
           ZStream.unfoldZIO(_)(readDelimitedFrom(descriptor))
         )
       )
 
-    ZStream.unwrap(
-      getDescriptor(pathToCompiledProto, messageType)
-        .map(d => singleMessage(d) orElse delimitedMessages(d))
-    )
+    singleMessage(descriptor) orElse delimitedMessages(descriptor)
 
-  private def getDescriptor(pathToCompiledProto: String, messageType: String): Task[Descriptors.Descriptor] =
+  private def getDescriptors(pathToCompiledProto: String): Task[List[Descriptor]] =
 
     def build(
       fileProto: FileDescriptorProto,
@@ -63,21 +69,23 @@ object ProtobufDecoderUtils:
             case None     => buildAll(t :+ h, fileDescriptorsByFileName)
             case Some(fd) => buildAll(t, fileDescriptorsByFileName + (fd.getName() -> fd))
 
-    def findMessageTypeByName(fileDescriptorsByFileName: Map[String, Descriptors.FileDescriptor], messageType: String): scala.Option[Descriptors.Descriptor] =
-      (for
+    def descriptors(fileDescriptorsByFileName: Map[String, Descriptors.FileDescriptor]): List[Descriptor] =
+      for
         fd <- fileDescriptorsByFileName.values.toList
         d  <- fd.getMessageTypes().asScala.toList
-        if d.getFullName() == messageType
-      yield d).headOption
+      yield d
 
     for
-      protoBytes        <- ZIO.attempt(Files.readAllBytes(Paths.get(pathToCompiledProto)))
-      fileDescriptorSet <- ZIO.attempt(DescriptorProtos.FileDescriptorSet.parseFrom(protoBytes))
-      protoFiles        <- ZIO.attempt(fileDescriptorSet.getFileList().asScala.toList)
-      find <- ZIO
-        .attempt(findMessageTypeByName(buildAll(protoFiles, Map.empty), messageType))
-        .someOrFail(new RuntimeException(s"Could not find message type: $messageType"))
-    yield find
+      protoBytes         <- ZIO.attempt(Files.readAllBytes(Paths.get(pathToCompiledProto)))
+      fileDescriptorSet  <- ZIO.attempt(DescriptorProtos.FileDescriptorSet.parseFrom(protoBytes))
+      protoFiles         <- ZIO.attempt(fileDescriptorSet.getFileList().asScala.toList)
+      fileDescriptorsMap <- ZIO.attempt(buildAll(protoFiles, Map.empty))
+    yield descriptors(fileDescriptorsMap)
+
+  private def getDescriptor(pathToCompiledProto: String, messageType: String): Task[Descriptors.Descriptor] =
+    getDescriptors(pathToCompiledProto)
+      .map(_.find(_.getFullName() == messageType))
+      .someOrFail(new RuntimeException(s"Could not find message type: $messageType"))
 
   private def createCodedInputStream(path: String): RIO[Scope, CodedInputStream] =
     for
